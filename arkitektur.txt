@@ -1,0 +1,29 @@
+allokera/                                 // Projektroten (Python-paket)
+│
+├── __init__.py                           // (valfritt) gör roten till paket; kan lämnas tom
+├── main.py                               // Startpunkt: skapar Tkinter-fönster och startar App
+├── requirements.txt                      // Lista på pip-beroenden
+│
+├── config/                               // Konfiguration & konstanter
+│   ├── __init__.py                       // exportera t.ex. APP_TITLE om du vill
+│   └── constants.py                      // APP_TITLE, statuskoder, filterlistor, NEAR_MISS_PCT m.m.
+│
+├── io/                                   // In-/utdata (läs/skriv filer) + scheman
+│   ├── __init__.py                       // samlar export från io-moduler vid behov
+│   ├── excel_export.py                   // funktioner som skriver/öppnar Excel/CSV (resultat, refill, sales)
+│   ├── file_readers.py                   // normalisering av CSV (saldo, ej inlagrade, plocklogg) + läs-hjälpare
+│   └── schemas.py                        // kolumnalias för auto-matchning (ORDER_SCHEMA, BUFFER_SCHEMA, ...)
+│
+├── logic/                                // Kärnlogik (”business logic”)
+│   ├── __init__.py                       // t.ex. from .allocation import allocate
+│   ├── allocation.py                     // allocate(): Helpall→Autostore→Huvudplock + near-miss
+│   ├── refill.py                         // calculate_refill(), annotate_refill(), _reclassify_skrymmande()
+│   └── sales.py                          // compute_sales_metrics() + open_sales_insights()
+│
+├── gui/                                  // Användargränssnitt (Tkinter)
+│   ├── __init__.py                       // exportera App om du vill: from .app import App
+│   └── app.py                            // App-klassen (widgets, filval, logg, knappar, orkestrering)
+│
+└── utils/                                // Gemensamma hjälpfunktioner
+    ├── __init__.py                       // export av utils-funktioner om du vill
+    └── common.py                         // _open_df_in_excel, smart_to_datetime, find_col, to_num, m.m.
