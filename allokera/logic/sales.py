@@ -7,7 +7,7 @@ from ..io.excel_export import open_sales_excel
 
 
 # ---------------------------
-# Hjälpfunktioner (snabba, robusta)
+# Hjälpfunktioner
 # ---------------------------
 
 def _to_date(s: pd.Series) -> pd.Series:
@@ -23,52 +23,70 @@ def _first_nonempty(s: pd.Series) -> str:
     return ""
 
 def _detect_col(df: pd.DataFrame, candidates) -> Optional[str]:
-    cols = {c.lower(): c for c in df.columns}
+    """Sök kolumn via exakta namn (case-insensitivt) och därefter 'contains'."""
+    if df is None or df.empty:
+        return None
+    # exakta (case-insensitiv)
+    lowmap = {c.lower(): c for c in df.columns}
     for cand in candidates:
-        lc = cand.lower()
-        if lc in cols:
-            return cols[lc]
-    # fuzzy: contains
-    for name in df.columns:
-        low = name.lower()
-        if any(lc in low for lc in [c.lower() for c in candidates]):
-            return name
+        if cand.lower() in lowmap:
+            return lowmap[cand.lower()]
+    # contains
+    lcands = [c.lower() for c in candidates]
+    for col in df.columns:
+        low = col.lower()
+        if any(c in low for c in lcands):
+            return col
     return None
 
 def _prep_plocklogg(df_norm: pd.DataFrame) -> pd.DataFrame:
-    """Förväntar sig minst: Artikelnummer, Plockat, Datum.
-       Försöker hämta Zon från kolumn 'Zon' eller 'Plockplats' i loggen om de finns."""
+    """Förväntar: Artikelnummer, datum, plockat. Hämtar/deriverar Zon om möjligt."""
+    if df_norm is None or df_norm.empty:
+        raise ValueError("Plocklogg är tom.")
     df = df_norm.copy()
+
     # Artikelnr
     if "Artikelnummer" not in df.columns:
         raise ValueError("Plocklogg saknar kolumn 'Artikelnummer' efter normalisering.")
     df["Artikelnummer"] = df["Artikelnummer"].astype(str).str.strip()
 
     # Datum
-    dt_col = _detect_col(df, ["Datum", "Datum/tid", "Date"])
+    dt_col = _detect_col(df, ["Datum", "Datum/tid", "Date", "Tidpunkt"])
     if not dt_col:
         raise ValueError("Plocklogg saknar datumkolumn (t.ex. 'Datum').")
     df["DatumNorm"] = _to_date(df[dt_col])
 
-    # Plockat
+    # Plockat (antal)
     qty_col = _detect_col(df, ["Plockat", "Antal", "Quantity", "Qty"])
     if not qty_col:
-        raise ValueError("Plocklogg saknar kolumn för antal (t.ex. 'Plockat').")
+        raise ValueError("Plocklogg saknar kolumn för antal (t.ex. 'Plockat'/'Antal').")
     df["Plockat"] = _to_num(df[qty_col]).fillna(0.0)
 
-    # Zon (om möjligt)
-    zon_col = _detect_col(df, ["Zon"])
+    # --- ZON ---
+    # 1) Direkt zon-kolumn
+    zon_col = _detect_col(df, [
+        "Zon", "Lagerzon", "Zon (beräknad)", "Zon (Beräknad)",
+        "Plockzon", "PickZone", "Zone"
+    ])
     if zon_col:
-        df["Zon"] = df[zon_col].astype(str).str.strip().str.upper().str[0]
+        z = df[zon_col].astype(str).str.strip().str.upper()
+        df["Zon"] = z.str[0]  # första bokstaven räcker (E, H, ...)
     else:
-        # Prova avleda zon från en plockplats-kolumn i loggen
-        place_col = _detect_col(df, ["Plockplats", "Lagerplats", "Plats"])
+        # 2) Försök härleda från plats-kolumn (plockplats/lagerplats/…)
+        place_col = _detect_col(df, [
+            "Plockplats", "Lagerplats", "Plats", "Location", "Lagerlokation",
+            "PickLocation", "LagPlats", "Lokation", "Loc"
+        ])
         if place_col:
-            df["Zon"] = df[place_col].astype(str).str.strip().str.upper().str[0]
+            place = df[place_col].astype(str).str.strip().str.upper()
+            # Ta första bokstav a–z om den finns, annars NaN
+            # (t.ex. 'E12-03' → 'E')
+            z_guess = place.str.extract(r'^\s*([A-ZÅÄÖ])', expand=False)
+            df["Zon"] = z_guess.str.replace("Å","A").str.replace("Ä","A").str.replace("Ö","O")
         else:
-            df["Zon"] = pd.Series([None] * len(df), dtype="object")
+            df["Zon"] = pd.NA
 
-    # Rensa bort rader utan giltigt datum
+    # Rensa rader utan giltigt datum
     df = df[~df["DatumNorm"].isna()].copy()
     return df
 
@@ -86,21 +104,19 @@ def _days_and_avg(daily_df: pd.DataFrame) -> pd.DataFrame:
     """Räknar antal dagar (med DagSum>0) och snitt per plockdag."""
     if daily_df.empty:
         return pd.DataFrame(columns=["Artikelnummer", "Dagar", "SnittPerDag"])
-    # räkna bara dagar där något faktiskt plockats (>0)
     d = daily_df[daily_df["DagSum"] > 0].copy()
     if d.empty:
         return pd.DataFrame(columns=["Artikelnummer", "Dagar", "SnittPerDag"])
     days = d.groupby("Artikelnummer")["DatumNorm"].nunique().rename("Dagar")
-    avg = d.groupby("Artikelnummer")["DagSum"].mean().rename("SnittPerDag")
+    avg  = d.groupby("Artikelnummer")["DagSum"].mean().rename("SnittPerDag")
     out = pd.concat([days, avg], axis=1).reset_index()
     return out
 
 def _prep_saldo(saldo_norm: Optional[pd.DataFrame]) -> pd.DataFrame:
-    """Förväntar: Artikel (artikelnummer), Plockplats (text)."""
+    """Saldo för plockplats per artikel."""
     if saldo_norm is None or saldo_norm.empty:
         return pd.DataFrame(columns=["Artikelnummer", "Plockplats"])
     s = saldo_norm.copy()
-    # I normaliserad saldo använder du oftast 'Artikel' som artikelnummer → döp om.
     if "Artikelnummer" not in s.columns and "Artikel" in s.columns:
         s = s.rename(columns={"Artikel": "Artikelnummer"})
     s["Artikelnummer"] = s["Artikelnummer"].astype(str).str.strip()
@@ -108,14 +124,12 @@ def _prep_saldo(saldo_norm: Optional[pd.DataFrame]) -> pd.DataFrame:
         s["Plockplats"] = s["Plockplats"].astype(str).fillna("").str.strip()
     else:
         s["Plockplats"] = ""
-    # välj en plockplats per artikel: första icke-tomma
     agg = (s.groupby("Artikelnummer", as_index=False)
              .agg({"Plockplats": _first_nonempty}))
     return agg
 
 def _prep_buffer(buffer_df: Optional[pd.DataFrame]) -> pd.DataFrame:
-    """Förväntar: artikelkolumn + 'Antal' på buffertpallar. Returnerar medel 'Antal per pall' per artikel
-       efter att ha filtrerat bort extremt små outliers (<50% av medianen)."""
+    """Medel 'Antal per pall' per artikel från buffertpallar, ta bort extremt små outliers (<50% av median)."""
     if buffer_df is None or buffer_df.empty:
         return pd.DataFrame(columns=["Artikelnummer", "Antal per pall"])
 
@@ -136,8 +150,7 @@ def _prep_buffer(buffer_df: Optional[pd.DataFrame]) -> pd.DataFrame:
         med = float(vals.median())
         if med <= 0:
             return float(vals.mean())
-        # ta bort extremt små outliers (< 50% av medianen)
-        filt = vals[vals >= 0.5 * med]
+        filt = vals[vals >= 0.5 * med]  # ta bort extremt små outliers
         if len(filt) == 0:
             filt = vals
         return float(filt.mean())
@@ -150,7 +163,7 @@ def _prep_buffer(buffer_df: Optional[pd.DataFrame]) -> pd.DataFrame:
 
 
 # ---------------------------
-# Huvud-API (behåll namnen så GUI kan anropa som tidigare)
+# Huvud-API (snabbt underlag)
 # ---------------------------
 
 def compute_sales_metrics(
@@ -159,16 +172,7 @@ def compute_sales_metrics(
     saldo_norm: Optional[pd.DataFrame] = None,
     buffer_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
-    """
-    "Metrics"-bas som open_sales_insights använder för att bygga flikarna.
-    Gör MINIMAL beräkning:
-      - Antal dagar i plock (alla zoner)
-      - Snitt per plockdag (alla zoner)
-      - Zon-sättning per artikel (för 'Endast EH i Plock')
-      - Antal E-dagar + E-snitt
-      - Plockplats (från saldo)
-      - Antal per pall (från buffertpallar)
-    """
+    """Tar fram minsta möjliga underlag för våra två flikar."""
     df = _prep_plocklogg(df_norm)
 
     # Per dag per artikel (alla zoner)
@@ -178,15 +182,18 @@ def compute_sales_metrics(
                  "SnittPerDag": "Snitt beställt per plockdag"}
     )
 
-    # Zoner per artikel (för att veta "Endast E" resp "Endast E & H")
-    # Om 'Zon' saknas blir set tomt → hamnar inte i EH-fliken
-    zmap = (df.dropna(subset=["Zon"])
-              .groupby("Artikelnummer")["Zon"]
-              .apply(lambda s: "".join(sorted(set([str(x)[:1] for x in s if isinstance(x, str) and x]))))
-              .rename("ZonSet")
-              .reset_index())
+    # Zon-set per artikel
+    # (Filtrera bort NaN/okända zoner så de inte stör 'Endast E' / 'E & H')
+    if "Zon" in df.columns:
+        zmap = (df.dropna(subset=["Zon"])
+                  .groupby("Artikelnummer")["Zon"]
+                  .apply(lambda s: "".join(sorted(set([str(x)[:1] for x in s if isinstance(x, str) and x]))))
+                  .rename("ZonSet")
+                  .reset_index())
+    else:
+        zmap = pd.DataFrame({"Artikelnummer": [], "ZonSet": []})
 
-    # Endast E-data (för E-dagar och E-snitt)
+    # Endast E (E-dagar och E-snitt)
     if "Zon" in df.columns and df["Zon"].notna().any():
         daily_e = _build_daily(df, mask=(df["Zon"] == "E"))
         e_stats = _days_and_avg(daily_e).rename(
@@ -198,7 +205,7 @@ def compute_sales_metrics(
                                         "Antal dagar i plock (Endast E-zon)",
                                         "Snitt beställt per plockdag (Endast E-zon)"])
 
-    # Slå ihop bas
+    # Bas
     base = any_stats.merge(zmap, on="Artikelnummer", how="left") \
                     .merge(e_stats, on="Artikelnummer", how="left")
 
@@ -210,7 +217,7 @@ def compute_sales_metrics(
     buff_m = _prep_buffer(buffer_df)
     base = base.merge(buff_m, on="Artikelnummer", how="left")
 
-    # Rensa typer/format
+    # Typer/format
     for col in ["Antal dagar i plock",
                 "Antal dagar i plock (Endast E-zon)"]:
         if col in base.columns:
@@ -222,21 +229,12 @@ def compute_sales_metrics(
         if col in base.columns:
             base[col] = _to_num(base[col]).round(2)
 
-    # Se till att viktiga kolumner finns
-    for col in ["Plockplats", "Antal per pall",
-                "Antal dagar i plock",
-                "Snitt beställt per plockdag",
-                "Antal dagar i plock (Endast E-zon)",
-                "Snitt beställt per plockdag (Endast E-zon)"]:
-        if col not in base.columns:
-            base[col] = pd.NA
-
-    # Om Artikel (namn) finns i df_norm: lägg till (kan vara bra vid behov)
+    # Om Artikel finns i df_norm, lägg till
     if "Artikel" in getattr(df_norm, "columns", []):
         names = df_norm[["Artikelnummer", "Artikel"]].drop_duplicates()
         base = base.merge(names, on="Artikelnummer", how="left")
 
-    # Kolumnordning för intern bas
+    # Kolumnordning (intern)
     ordered = ["Artikelnummer", "Artikel", "Plockplats",
                "Antal dagar i plock", "Snitt beställt per plockdag",
                "Antal per pall",
@@ -250,23 +248,14 @@ def compute_sales_metrics(
 
 
 def open_sales_insights(metrics: pd.DataFrame) -> str:
-    """
-    Bygger exakt två flikar enligt önskemål och öppnar i Excel:
-      - 'Rekomenderade buffertuppdateringar'
-      - 'Endast EH i Plock'
-    """
+    """Bygger två flikar enligt krav och öppnar i Excel."""
     if metrics is None or metrics.empty:
         raise RuntimeError("Inga data att visa.")
 
     df = metrics.copy()
 
     # -------- Flik 1: Rekomenderade buffertuppdateringar --------
-    # Plockplats slutar på "1"
-    if "Plockplats" in df.columns:
-        mask_1 = df["Plockplats"].astype(str).str.endswith("1")
-    else:
-        mask_1 = pd.Series([False] * len(df))
-
+    mask_1 = df.get("Plockplats", pd.Series([""]*len(df))).astype(str).str.endswith("1")
     rec = (df[mask_1]
              .loc[:, ["Artikelnummer",
                       "Plockplats",
@@ -278,28 +267,25 @@ def open_sales_insights(metrics: pd.DataFrame) -> str:
              .reset_index(drop=True))
 
     # -------- Flik 2: Endast EH i Plock --------
-    # Behöver ZonSet (skapad från plocklogg). 'E' → bara E. 'EH' → E & H. Annat → exkluderas.
-    # (Om ZonSet saknas → tom flik)
-    if "ZonSet" in df.columns:
-        only_e  = df["ZonSet"].fillna("").str.fullmatch(r"E", na=False)
-        only_eh = df["ZonSet"].fillna("").str.fullmatch(r"EH|HE", na=False)
+    # ZonSet = t.ex. "E", "EH", "HE", "H", "AR" ...
+    zonset = df.get("ZonSet")
+    if zonset is not None:
+        only_e  = zonset.fillna("").str.fullmatch(r"E", na=False)
+        only_eh = zonset.fillna("").str.fullmatch(r"EH|HE", na=False)
+        ehe = pd.concat([
+            df[only_e ].assign(Kategori="Endast E"),
+            df[only_eh].assign(Kategori="Endast E & H"),
+        ], ignore_index=True)
     else:
-        only_e = pd.Series([False] * len(df))
-        only_eh = pd.Series([False] * len(df))
+        ehe = df.iloc[0:0].copy()
+        ehe["Kategori"] = pd.Series(dtype=object)
 
-    ehe = pd.concat([
-        df[only_e ].assign(Kategori="Endast E"),
-        df[only_eh].assign(Kategori="Endast E & H"),
-    ], ignore_index=True)
-
-    # Välj kolumner & sortera
     ehe_cols = ["Artikelnummer",
                 "Plockplats",
                 "Antal dagar i plock (Endast E-zon)",
                 "Snitt beställt per plockdag (Endast E-zon)",
                 "Antal per pall",
                 "Kategori"]
-    # Säkerställ att kolumner finns
     for c in ehe_cols:
         if c not in ehe.columns:
             ehe[c] = pd.NA
@@ -310,7 +296,6 @@ def open_sales_insights(metrics: pd.DataFrame) -> str:
                           ascending=[False, False])
              .reset_index(drop=True))
 
-    # Bygg xlsx
     sheets: Dict[str, pd.DataFrame] = {
         "Rekomenderade buffertuppdateringar": rec,
         "Endast EH i Plock": ehe,
